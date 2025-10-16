@@ -1,0 +1,825 @@
+=== SOLUTION ARCHITECTURE BLUEPRINT ===
+
+Device Models and Roles:
+- Router: Cisco ISR 4331 - Branch router, edge security, DIA, WAN redundancy, branch backbone routing
+- Firewall: Cisco ASA 5516-X - Next-gen firewall w/IPS, PCI-DSS segmentation, compliance, security edge
+- Core Switch: Cisco Catalyst 9300 StackWise - Core banking switching, data center VLANs, routing, HSRP
+- Distribution Switch: Cisco Catalyst 9300 StackWise (secondary) - VLAN aggregation, redundancy, L3 distribution
+- Access Switch: Cisco Catalyst 2960-X PoE+ - User/device connectivity (teller, ATMs, phones, security)
+- Wireless Controller: Cisco 5520 - Centralized WLAN for branch, guest isolation, policy QoS, WPA3
+- Voice Gateway: Cisco ISR 4321 - SIP trunking, SRST, branch voice survivability
+
+Network Topology Description:
+- Dual-core (Catalyst 9300) with StackWise for redundancy, connecting ISR router/firewall and dist/access switches
+- Multi-layered VLAN segmentation per compliance; branch ATM, teller, customer WiFi, VoIP, security, core banking, and management logically separated and firewalled.
+- OSPF for dynamic routing, with authentication and area segmentation.
+- All device management isolated in dedicated management VLAN, with RBAC and 2FA enforced via RADIUS/TACACS+.
+- AAA, robust logging, network QoS prioritization, and failover paths built-in per compliance and business requirements.
+
+CRITICAL P2P VALIDATION REQUIREMENTS:
+- All P2P routed links use 10.10.255.0/24 /30s, matching IPs, accurate interface descriptions.
+- Inter-switch trunks are properly matched with allowed VLANs.
+- OSPF area alignments verified, dedicated mgmt and voice VLANs.
+- Redundant paths and HSRP on core/distribution for L3 gateway.
+
+---
+
+=== DEVICE 1: BRANCH-RTR1 (ISR 4331) ===
+! ===== SECTION: Basic Configuration =====
+hostname BRANCH-RTR1
+service password-encryption
+enable secret 9 $9$Jasdfs234sdfLxr
+no ip domain-lookup
+ip domain-name branchbank.local
+clock timezone EST -5 0
+logging buffered 16384 warnings
+logging trap informational
+logging host 192.168.100.10
+aaa new-model
+aaa authentication login default group radius local
+aaa authorization exec default group radius local
+aaa accounting exec default start-stop group radius
+
+username auditadmin privilege 15 secret 9 $9$faKEseCRetEnCryPt3d
+username snmpview secret 9 $9$oth3RfaKeENc
+
+vtp mode off
+ip ssh version 2
+ip ssh authentication-retries 3
+ip ssh time-out 60
+ip ssh source-interface GigabitEthernet0/0/0
+ip ssh rsa keypair-name rtr1-key
+crypto key generate rsa modulus 4096 label rtr1-key
+
+ip http secure-server
+ip http authentication aaa
+ip http timeout-policy idle 15 life 30 requests 100
+ip access-list standard MGMT-ACCESS
+ permit 192.168.100.0 0.0.0.255
+ permit 10.10.255.0 0.0.0.255
+!
+!
+banner login ^CUnauthorized access prohibited. All access monitored and logged per PCI-DSS policy.^C
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Interface Configuration =====
+interface GigabitEthernet0/0/0
+ description PRIMARY UPLINK to ISP1 (100Mbps Fiber)
+ ip address dhcp
+ ip nat outside
+ no shutdown
+
+interface Cellular0/2/0
+ description BACKUP 4G LTE Failover to ISP2
+ ip address negotiated
+ dialer-group 1
+ ip nat outside
+ no shutdown
+
+interface GigabitEthernet0/0/1
+ description P2P TO ASA-1 (To FIREWALL, 10.10.255.1/30)
+ ip address 10.10.255.1 255.255.255.252
+ ip nat inside
+ no shutdown
+
+interface GigabitEthernet0/0/2
+ description P2P TO CORE-SW1 (To Catalyst-9300 Stack, 10.10.255.5/30)
+ ip address 10.10.255.5 255.255.255.252
+ ip nat inside
+ no shutdown
+
+ip nat inside source list VLAN_NAT interface GigabitEthernet0/0/0 overload
+ip nat inside source list VLAN_NAT interface Cellular0/2/0 overload
+!
+access-list 10 permit 192.168.10.0 0.0.0.255
+access-list 10 permit 192.168.20.0 0.0.0.255
+access-list 10 permit 192.168.30.0 0.0.0.255
+access-list 10 permit 192.168.50.0 0.0.0.255
+access-list 10 permit 192.168.60.0 0.0.0.255
+access-list 10 permit 192.168.100.0 0.0.0.255
+!
+ip access-list extended NO_WIFI_BANK
+ deny   ip 192.168.40.0 0.0.0.255 192.168.10.0 0.0.0.255
+ permit ip any any
+
+ip access-list extended VLAN_NAT
+ permit ip 192.168.0.0 0.0.255.255 any
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Routing Protocols =====
+router ospf 1
+ router-id 10.10.255.1
+ passive-interface default
+ no passive-interface GigabitEthernet0/0/1
+ no passive-interface GigabitEthernet0/0/2
+ network 192.168.10.0 0.0.0.255 area 0
+ network 192.168.20.0 0.0.0.255 area 0
+ network 192.168.30.0 0.0.0.255 area 0
+ network 192.168.40.0 0.0.0.255 area 10
+ network 192.168.50.0 0.0.0.255 area 10
+ network 192.168.60.0 0.0.0.255 area 10
+ network 192.168.100.0 0.0.0.255 area 100
+ network 10.10.255.0 0.0.0.255 area 0
+ authentication message-digest
+!
+interface GigabitEthernet0/0/1
+ ip ospf authentication message-digest
+ ip ospf message-digest-key 1 md5 SecureOSPFAuth1
+
+interface GigabitEthernet0/0/2
+ ip ospf authentication message-digest
+ ip ospf message-digest-key 1 md5 SecureOSPFAuth1
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Security & Management =====
+! RBAC + TACACS+/RADIUS (Authentication w/2FA)
+aaa group server radius RAD-GRP
+ server-private 192.168.100.12 auth-port 1812 acct-port 1813 key radiuskeySTRONG!
+!
+radius-server attribute 6 on-for-login-auth
+radius-server host 192.168.100.12 auth-port 1812 acct-port 1813 key radiuskeySTRONG!
+!
+ip access-list extended MGMT-SECURE-IN
+ permit tcp 192.168.100.0 0.0.0.255 any eq 22
+ permit udp 192.168.100.0 0.0.0.255 any eq 161
+!
+line vty 0 4
+ transport input ssh
+ access-class MGMT-ACCESS in
+ login authentication default
+!
+snmp-server community SECUREsnmp1 RO 99
+snmp-server host 192.168.100.11 version 2c SECUREsnmp1
+snmp-server enable traps snmp authentication linkdown linkup coldstart warmstart
+!
+logging buffered 16384
+logging trap debugging
+!
+ip name-server 1.1.1.1
+ip name-server 8.8.8.8
+!
+crypto isakmp policy 10
+ encr aes 256
+ authentication pre-share
+ group 14
+!
+crypto ipsec transform-set TRANS-BANK esp-aes 256 esp-sha-hmac
+ mode tunnel
+!
+! IPSec profile for ATM tunnels, if required
+!
+! DDoS/Fraud Policy
+ip inspect name BANK-INSPECT tcp
+ip inspect name BANK-INSPECT udp
+ip inspect name BANK-INSPECT icmp
+!
+! Real-time event logging to SIEM
+logging host 192.168.100.10 transport udp port 514
+!
+! ===== END SECTION =====
+
+copy running-config startup-config
+
+---
+
+=== DEVICE 2: ASA-1 (ASA 5516-X with FirePOWER) ===
+! ===== SECTION: Basic Configuration =====
+hostname ASA-1
+enable password $9$SeCrEtPW1
+interface Management0/0
+ nameif management
+ security-level 100
+ ip address 192.168.100.2 255.255.255.0
+ management-only
+ no shutdown
+
+interface GigabitEthernet0/0
+ nameif OUTSIDE
+ security-level 0
+ ip address dhcp setroute
+ no shutdown
+
+interface GigabitEthernet0/1
+ description TO RTR1 (10.10.255.2)
+ nameif INSIDE
+ security-level 100
+ ip address 10.10.255.2 255.255.255.252
+ no shutdown
+
+interface GigabitEthernet0/2
+ description TO Core-Switch1 (10.10.255.9)
+ nameif INSIDE_CORE
+ security-level 100
+ ip address 10.10.255.9 255.255.255.252
+ no shutdown
+
+! ===== END SECTION =====
+
+! ===== SECTION: Segmentation, ACL & Security =====
+object-group network CDE
+ network-object 192.168.10.0 255.255.255.0
+ network-object 192.168.100.0 255.255.255.0
+!
+object-group network ATMS
+ network-object 192.168.20.0 255.255.255.0
+!
+object-group network TELLERS
+ network-object 192.168.30.0 255.255.255.0
+!
+object-group network GUESTS
+ network-object 192.168.40.0 255.255.255.0
+!
+object-group network SECURITY
+ network-object 192.168.50.0 255.255.255.0
+!
+object-group network VOIP
+ network-object 192.168.60.0 255.255.255.0
+!
+! Deny GUESTS to CDE (PCI-DSS)
+access-list INSIDE_IN extended deny ip GUESTS CDE
+! Deny WiFi to ATMs/Tellers
+access-list INSIDE_IN extended deny ip GUESTS ATMS
+access-list INSIDE_IN extended deny ip GUESTS TELLERS
+! Allow CDE to ATMs/Tellers/SECURITY/VOIP/Internet
+access-list INSIDE_IN extended permit ip CDE any
+access-list INSIDE_IN extended permit ip ATMS any
+access-list INSIDE_IN extended permit ip TELLERS any
+access-list INSIDE_IN extended permit ip SECURITY any
+access-list INSIDE_IN extended permit ip VOIP any
+! Permit management
+access-list INSIDE_IN extended permit ip MANAGEMENT any
+! Drop all other by default
+access-list INSIDE_IN extended deny ip any any log
+!
+access-group INSIDE_IN in interface INSIDE_CORE
+
+! Enable IPS/FirePOWER for banking/ATM VLANs
+class-map ATMS
+ match access-list ATMS-TRAFFIC
+
+policy-map global_policy
+ class inspection_default
+  inspect dns migrated_dns_map_1 
+  inspect ftp
+  inspect http
+  inspect icmp
+  inspect snmp
+ class ATMS
+  ips promiscuous mode
+  inspect
+!
+service-policy global_policy global
+!
+! Real-time transaction monitoring, logging, SIEM integration
+logging host MANAGEMENT 192.168.100.10
+logging trap informational
+logging enable
+!
+! Deep packet inspection for core VLANs (mod probe set via FirePOWER GUI)
+! ===== END SECTION =====
+
+! ===== SECTION: Management & AAA =====
+aaa-server RAD-GRP protocol radius
+aaa-server RAD-GRP (management) host 192.168.100.12
+ key radiuskeySTRONG!
+!
+aaa authentication ssh console RAD-GRP LOCAL
+aaa authorization command RAD-GRP LOCAL
+aaa accounting command RAD-GRP
+!
+ssh 192.168.100.0 255.255.255.0 management
+telnet timeout 0
+console timeout 15
+!
+snmp-server host 192.168.100.11 community SECUREsnmp1
+snmp-server enable traps
+!
+! SIEM event trapping
+!
+asdm history enable
+asdm location 192.168.100.0 255.255.255.0 management
+!
+! ===== END SECTION =====
+
+write memory
+
+---
+
+=== DEVICE 3: CORE-SW1 (C9300-Stack) ===
+! ===== SECTION: Basic Configuration =====
+hostname CORE-SW1
+service password-encryption
+enable secret 9 $9$SomeCorEStackPW
+clock timezone EST -5 0
+vtp mode transparent
+spanning-tree mode rapid-pvst
+spanning-tree extend system-id
+logging buffered 16384 warnings
+ntp server 192.168.100.11
+!
+! RBAC local accounts
+username auditadmin privilege 15 secret 9 $9$CorEAdmP@ssword
+username opsuser privilege 5 secret 9 $9$s3cureops
+!
+banner motd ^CRole based access, all activity logged and monitored per compliance. Unauthorized access prosecuted.^C
+!
+! ===== END SECTION =====
+
+! ===== SECTION: VLAN & Trunking =====
+vlan 10
+ name CORE-BANKING
+vlan 20
+ name ATM
+vlan 30
+ name TELLER
+vlan 40
+ name CUSTOMER-WIFI
+vlan 50
+ name SECURITY-SYSTEMS
+vlan 60
+ name VOIP
+vlan 100
+ name MANAGEMENT
+
+interface Vlan10
+ description Core Banking VLAN SVI
+ ip address 192.168.10.1 255.255.255.0
+ ip ospf 1 area 0
+ ip ospf authentication message-digest
+ ip ospf message-digest-key 1 md5 SecureOSPFAuth1
+
+interface Vlan20
+ description ATM VLAN SVI
+ ip address 192.168.20.1 255.255.255.0
+ ip ospf 1 area 0
+ ip ospf authentication message-digest
+ ip ospf message-digest-key 1 md5 SecureOSPFAuth1
+
+interface Vlan30
+ description TELLER VLAN SVI
+ ip address 192.168.30.1 255.255.255.0
+ ip ospf 1 area 0
+ ip ospf authentication message-digest
+ ip ospf message-digest-key 1 md5 SecureOSPFAuth1
+
+interface Vlan40
+ description CUSTOMER WIFI VLAN SVI
+ ip address 192.168.40.1 255.255.255.0
+ ip ospf 1 area 10
+ ip ospf authentication message-digest
+ ip ospf message-digest-key 1 md5 SecureOSPFAuth1
+
+interface Vlan50
+ description SECURITY SYSTEMS VLAN SVI
+ ip address 192.168.50.1 255.255.255.0
+ ip ospf 1 area 10
+ ip ospf authentication message-digest
+ ip ospf message-digest-key 1 md5 SecureOSPFAuth1
+
+interface Vlan60
+ description VOIP VLAN SVI
+ ip address 192.168.60.1 255.255.255.0
+ ip ospf 1 area 10
+ ip ospf authentication message-digest
+ ip ospf message-digest-key 1 md5 SecureOSPFAuth1
+
+interface Vlan100
+ description MGMT VLAN SVI
+ ip address 192.168.100.1 255.255.255.0
+ ip ospf 1 area 100
+ ip ospf authentication message-digest
+ ip ospf message-digest-key 1 md5 SecureOSPFAuth1
+
+! Trunk to Distribution and Access Switches
+interface TenGigabitEthernet1/1/1
+ description TRUNK TO DIST-SW1
+ switchport trunk encapsulation dot1q
+ switchport mode trunk
+ switchport trunk allowed vlan 10,20,30,40,50,60,100
+ spanning-tree portfast trunk
+
+interface TenGigabitEthernet1/1/2
+ description TRUNK TO DIST-SW2
+ switchport trunk encapsulation dot1q
+ switchport mode trunk
+ switchport trunk allowed vlan 10,20,30,40,50,60,100
+ spanning-tree portfast trunk
+
+interface GigabitEthernet1/0/48
+ description Uplink to ASA-1 (10.10.255.10/30)
+ no switchport
+ ip address 10.10.255.10 255.255.255.252
+ ip ospf 1 area 0
+ ip ospf authentication message-digest
+ ip ospf message-digest-key 1 md5 SecureOSPFAuth1
+
+interface GigabitEthernet1/0/47
+ description Uplink to BRANCH-RTR1 (10.10.255.6/30)
+ no switchport
+ ip address 10.10.255.6 255.255.255.252
+ ip ospf 1 area 0
+ ip ospf authentication message-digest
+ ip ospf message-digest-key 1 md5 SecureOSPFAuth1
+
+! ===== END SECTION =====
+
+! ===== SECTION: Layer 3 & Routing =====
+ip routing
+
+router ospf 1
+ router-id 10.10.255.10
+ passive-interface default
+ no passive-interface GigabitEthernet1/0/48
+ no passive-interface GigabitEthernet1/0/47
+ network 192.168.10.0 0.0.0.255 area 0
+ network 192.168.20.0 0.0.0.255 area 0
+ network 192.168.30.0 0.0.0.255 area 0
+ network 192.168.40.0 0.0.0.255 area 10
+ network 192.168.50.0 0.0.0.255 area 10
+ network 192.168.60.0 0.0.0.255 area 10
+ network 192.168.100.0 0.0.0.255 area 100
+ network 10.10.255.8 0.0.0.3 area 0
+ network 10.10.255.4 0.0.0.3 area 0
+ authentication message-digest
+
+! HSRP for each VLAN (example for VLANs 10, 20 - extend for others)
+interface Vlan10
+ standby 10 ip 192.168.10.254
+ standby 10 priority 110
+ standby 10 preempt
+ standby 10 authentication md5 SecureHSRPPwd1
+interface Vlan20
+ standby 20 ip 192.168.20.254
+ standby 20 priority 110
+ standby 20 preempt
+ standby 20 authentication md5 SecureHSRPPwd1
+
+! ===== END SECTION =====
+
+! ===== SECTION: Security, QoS & Management =====
+ip access-list extended MGMT-IN
+ permit tcp 192.168.100.0 0.0.0.255 any eq 22
+ permit udp 192.168.100.0 0.0.0.255 any eq 161 162
+!
+line vty 0 15
+ transport input ssh
+ access-class MGMT-IN in
+ login local
+
+snmp-server community SECUREsnmp1 RO
+snmp-server host 192.168.100.11 version 2c SECUREsnmp1
+snmp-server enable traps snmp authentication linkdown linkup coldstart warmstart
+!
+logging host 192.168.100.10
+!
+mls qos
+auto qos voip trust
+!
+! Port security for all access ports (example 1-40, modify per site)
+interface range GigabitEthernet1/0/1-40
+ switchport mode access
+ switchport port-security
+ switchport port-security maximum 2
+ switchport port-security violation restrict
+ switchport port-security aging time 2
+ spanning-tree portfast
+!
+service timestamps log datetime msec
+!
+! ===== END SECTION =====
+
+copy running-config startup-config
+
+---
+
+=== DEVICE 4: DIST-SW1 (C9300-Stack) ===
+! ===== SECTION: Basic Configuration =====
+hostname DIST-SW1
+service password-encryption
+enable secret 9 $9$DistSw1Secr
+clock timezone EST -5 0
+vtp mode transparent
+spanning-tree mode rapid-pvst
+spanning-tree extend system-id
+logging buffered 16384
+
+! ===== END SECTION =====
+
+! ===== SECTION: VLAN & Trunking =====
+vlan 10
+ name CORE-BANKING
+vlan 20
+ name ATM
+vlan 30
+ name TELLER
+vlan 40
+ name CUSTOMER-WIFI
+vlan 50
+ name SECURITY-SYSTEMS
+vlan 60
+ name VOIP
+vlan 100
+ name MANAGEMENT
+
+interface range GigabitEthernet1/0/1-40
+ switchport mode access
+ switchport access vlan 30
+ spanning-tree portfast
+
+interface GigabitEthernet1/0/41
+ description TRUNK to CORE-SW1
+ switchport trunk encapsulation dot1q
+ switchport mode trunk
+ switchport trunk allowed vlan 10,20,30,40,50,60,100
+ spanning-tree portfast trunk
+
+interface range GigabitEthernet1/0/42-48
+ description TRUNK to ACCESS Switches
+ switchport trunk encapsulation dot1q
+ switchport mode trunk
+ switchport trunk allowed vlan 10,20,30,40,50,60,100
+ spanning-tree portfast trunk
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Security =====
+ip access-list standard MGMT-ACCESS
+ permit 192.168.100.0 0.0.0.255
+!
+line vty 0 15
+ transport input ssh
+ access-class MGMT-ACCESS in
+ login local
+!
+! Port security all downlink ports
+interface range GigabitEthernet1/0/1-40
+ switchport port-security
+ switchport port-security maximum 2
+ switchport port-security violation restrict
+ switchport port-security aging time 2
+!
+! ===== END SECTION =====
+
+copy running-config startup-config
+
+---
+
+=== DEVICE 5: ACCESS-SW1 (C2960X) ===
+! ===== SECTION: Basic Configuration =====
+hostname ACCESS-SW1
+service password-encryption
+enable secret 9 $9$ACcesSsecreT
+clock timezone EST -5 0
+vtp mode transparent
+spanning-tree mode rapid-pvst
+spanning-tree extend system-id
+logging buffered 8192
+
+! ===== END SECTION =====
+
+! ===== SECTION: VLAN & Port Assignment =====
+vlan 10
+ name CORE-BANKING
+vlan 20
+ name ATM
+vlan 30
+ name TELLER
+vlan 40
+ name CUSTOMER-WIFI
+vlan 50
+ name SECURITY-SYSTEMS
+vlan 60
+ name VOIP
+vlan 100
+ name MANAGEMENT
+
+! User and ATM port configuration
+interface range GigabitEthernet1/0/1-6
+ description ATM Connectivity
+ switchport mode access
+ switchport access vlan 20
+ switchport port-security
+ switchport port-security maximum 1
+ switchport port-security violation restrict
+ spanning-tree portfast
+
+interface range GigabitEthernet1/0/7-22
+ description Teller Workstations
+ switchport mode access
+ switchport access vlan 30
+ switchport port-security
+ switchport port-security maximum 2
+ switchport port-security violation restrict
+ spanning-tree portfast
+
+interface range GigabitEthernet1/0/23-28
+ description VoIP handsets
+ switchport mode access
+ switchport access vlan 60
+ switchport voice vlan 60
+ spanning-tree portfast
+
+interface range GigabitEthernet1/0/29-34
+ description Security Cameras
+ switchport mode access
+ switchport access vlan 50
+ switchport port-security
+ switchport port-security maximum 2
+ switchport port-security violation restrict
+ spanning-tree portfast
+
+interface range GigabitEthernet1/0/35-44
+ description Customer WiFi AP uplinks/PoE
+ switchport mode access
+ switchport access vlan 40
+ spanning-tree portfast
+
+interface GigabitEthernet1/0/45
+ description TRUNK TO DIST-SW1
+ switchport trunk encapsulation dot1q
+ switchport mode trunk
+ switchport trunk allowed vlan 10,20,30,40,50,60,100
+ spanning-tree portfast trunk
+
+interface GigabitEthernet1/0/48
+ description MGMT (OOB/192.168.100.x)
+ switchport mode access
+ switchport access vlan 100
+ spanning-tree portfast
+
+! ===== END SECTION =====
+
+! ===== SECTION: Security =====
+ip access-list standard ADMIN-ACCESS
+ permit 192.168.100.0 0.0.0.255
+!
+line vty 0 15
+ transport input ssh
+ access-class ADMIN-ACCESS in
+ login local
+!
+! ===== END SECTION =====
+
+copy running-config startup-config
+
+---
+
+=== DEVICE 6: WLC-1 (C5520) ===
+! ===== SECTION: Basic Configuration =====
+! Initial config through web GUI, but minimum CLI essentials provided
+! For context: 
+hostname WLC-1
+!
+interface GigabitEthernet0
+ ip address 192.168.100.3 255.255.255.0
+ no shutdown
+!
+ip default-gateway 192.168.100.1
+!
+! ===== END SECTION =====
+
+! ===== SECTION: SSID, WLAN & Security =====
+! Secure enterprise FSID
+wlan BANK-STAFF 10 BANK-STAFF
+ security wpa wpa2 aes
+ security wpa akm 802.1x
+ radius-server 192.168.100.12 key SharedRAD1!
+ vlan 30
+!
+wlan ATM-OPS 20 ATM-OPS
+ security wpa wpa2 aes
+ security wpa akm 802.1x
+ radius-server 192.168.100.12 key SharedRAD1!
+ vlan 20
+!
+wlan CUSTOMER-GUEST 40 CUSTOMER-GUEST
+ security wpa wpa3
+ security wpa akm local
+ vlan 40
+!
+wlan BANK-SECURITY 50 BANK-SECURITY
+ security wpa wpa2 aes
+ security wpa akm local
+ vlan 50
+!
+management interface GigabitEthernet0
+controller interface-group MGMT
+!
+! Limit guest WiFi bandwidth
+policy-profile GUEST-POLICY
+ rate-limit per-client 2048 2048
+ wlan 40
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Monitoring, Logging, HA =====
+snmp-server community SECUREsnmp1 RO
+snmp-server host 192.168.100.11
+logging trap informational
+logging host 192.168.100.10
+!
+! ===== END SECTION =====
+
+copy running-config startup-config
+
+---
+
+=== DEVICE 7: VGW-1 (ISR 4321) ===
+! ===== SECTION: Basic Configuration =====
+hostname VGW-1
+enable secret 9 $9$VoICeGwP@ss
+service password-encryption
+ip domain-name branchbank.local
+crypto key generate rsa modulus 4096
+logging buffered 8192
+
+! ===== END SECTION =====
+
+! ===== SECTION: Voice & Dialplan =====
+voice service voip
+ allow-connections sip to sip
+ sip
+  registrar server expires max 3600 min 3600
+  bind control source-interface GigabitEthernet0/0/0
+!
+voice class codec 1
+ codec preference 1 g711ulaw
+!
+dial-peer voice 10 voip
+ destination-pattern .T
+ session protocol sipv2
+ session target ipv4:192.168.60.10
+ incoming called-number .
+ voice-class codec 1
+ dtmf-relay rtp-nte
+ no vad
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Interfaces =====
+interface GigabitEthernet0/0/0
+ description P2P to Core-SW1 (10.10.255.13/30)
+ ip address 10.10.255.13 255.255.255.252
+ no shutdown
+
+interface GigabitEthernet0/0/1
+ description SIP Trunk/Upstream
+ ip address dhcp
+ no shutdown
+
+interface Vlan60
+ description VOIP SVI
+ ip address 192.168.60.2 255.255.255.0
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Management & Security =====
+username voiceops privilege 15 secret 9 $9$VoIceAdmIn1!
+aaa new-model
+aaa authentication login default group radius local
+radius-server host 192.168.100.12 auth-port 1812 acct-port 1813 key radiuskeySTRONG!
+
+line vty 0 4
+ transport input ssh
+ login local
+!
+snmp-server community SECUREsnmp1 RO
+snmp-server host 192.168.100.11
+
+! ===== END SECTION =====
+
+copy running-config startup-config
+
+---
+
+=== DEPLOYMENT RECOMMENDATIONS ===
+
+Installation Sequence:
+1. Rack and cable Core switching stack (Core, Distribution, Access), trunk, P2P and management cables.
+2. Deploy ISR Routers and ASA (edge), connect P2P and management links.
+3. Implement Access Switches, voice gateway, WLC, and APs.
+4. Power up, perform initial configs (management VLAN, SSH).
+5. Deploy VLANs, SVIs, HSRP, OSPF with matching area and authentication.
+6. Enable NAT, apply firewall ACLs, enable IPS, configure logging and SNMP.
+7. Apply port security, QoS policies, Voice/SRTP config, and RBAC.
+8. Verify redundancy, failover, and cross-stack trunking.
+
+Verification Procedures:
+- `show ip ospf neighbor` (ensure full adjacency uptime)
+- `show standby` and `show redundancy`
+- `ping/traceroute` branch and banking hosts end-to-end
+- `show access-lists` and ASA packet-tracer for all security zones
+- `show interfaces status` and `show spanning-tree`
+- SSH access from management VLAN, RADIUS/TACACS test
+- Voice and WiFi registration, 802.1X auth smoke test
+
+=== DEPLOYMENT SUCCESS CRITERIA ===
+
+✓ CONNECTIVITY: End-to-end minimally 99.99% uptime, all VLANs reachable by designated zone, no WiFi to cardholder data paths
+✓ ROUTING: OSPF LSA propagation and area adjacency is verified, all route tables correct with match authentication and areas
+✓ SECURITY: Cardholder VLAN traffic is firewalled from non-compliant zones, PCI-DSS and audit controls in place, event logging verifies tamper resistance
+✓ MANAGEMENT: SSH and SNMP access from mgmt VLAN, AAA with MFA in effect, SIEM event transfer verified
+✓ REDUNDANCY: HSRP/StackWise failover functional, OSPF path redundancy, cellular backup auto-fails over, and HA registration on controllers
